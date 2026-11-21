@@ -25,6 +25,7 @@ keywords = ["quant", "quantitative", "investment", "trading", "algotrading", "ok
 dependencies = [
     "vnpy_rest",
     "vnpy_websocket",
+    "websocket-client",
 ]
 
 [project.urls]

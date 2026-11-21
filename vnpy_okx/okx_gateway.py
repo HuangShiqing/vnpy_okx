@@ -2,10 +2,11 @@ import base64
 import hashlib
 import hmac
 import json
+import ssl
 import time
 from copy import copy
 from datetime import datetime
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from types import TracebackType
 from collections.abc import Callable
 from time import sleep
@@ -22,7 +23,7 @@ from vnpy.trader.constant import (
     Status
 )
 from vnpy.trader.gateway import BaseGateway
-from vnpy.trader.utility import round_to, ZoneInfo
+from vnpy.trader.utility import ZoneInfo
 from vnpy.trader.object import (
     AccountData,
     BarData,
@@ -38,6 +39,7 @@ from vnpy.trader.object import (
 )
 from vnpy_rest import Request, Response, RestClient
 from vnpy_websocket import WebsocketClient
+import websocket
 
 
 # UTC timezone
@@ -45,15 +47,15 @@ UTC_TZ: ZoneInfo = ZoneInfo("UTC")
 
 # Real server hosts
 REAL_REST_HOST: str = "https://www.okx.com"
-REAL_PUBLIC_HOST: str = "wss://ws.okx.com:8443/ws/v5/public"
-REAL_PRIVATE_HOST: str = "wss://ws.okx.com:8443/ws/v5/private"
-REAL_BUSINESS_HOST: str = "wss://ws.okx.com:8443/ws/v5/business"
+REAL_PUBLIC_HOST: str = "wss://ws.okx.com/ws/v5/public"
+REAL_PRIVATE_HOST: str = "wss://ws.okx.com/ws/v5/private"
+REAL_BUSINESS_HOST: str = "wss://ws.okx.com/ws/v5/business"
 
 # Demo server hosts
 DEMO_REST_HOST: str = "https://openapi.okx.com"
-DEMO_PUBLIC_HOST: str = "wss://wspap.okx.com:8443/ws/v5/public"
-DEMO_PRIVATE_HOST: str = "wss://wspap.okx.com:8443/ws/v5/private"
-DEMO_BUSINESS_HOST: str = "wss://wspap.okx.com:8443/ws/v5/business"
+DEMO_PUBLIC_HOST: str = "wss://wspap.okx.com/ws/v5/public"
+DEMO_PRIVATE_HOST: str = "wss://wspap.okx.com/ws/v5/private"
+DEMO_BUSINESS_HOST: str = "wss://wspap.okx.com/ws/v5/business"
 
 # Order status map
 STATUS_OKX2VT: dict[str, Status] = {
@@ -117,6 +119,8 @@ class OkxGateway(BaseGateway):
         "Server": ["REAL", "DEMO"],
         "Proxy Host": "",
         "Proxy Port": 0,
+        "Proxy Username": "",
+        "Proxy Password": "",
         "Spread Trading": ["False", "True"],
         "Margin Currency": ""
     }
@@ -138,6 +142,8 @@ class OkxGateway(BaseGateway):
         self.server: str = ""
         self.proxy_host: str = ""
         self.proxy_port: int = 0
+        self.proxy_username: str = ""
+        self.proxy_password: str = ""
         self.spread_trading: bool = False
         self.margin_currency: str = ""
 
@@ -174,6 +180,8 @@ class OkxGateway(BaseGateway):
         self.server = setting["Server"]
         self.proxy_host = setting["Proxy Host"]
         self.proxy_port = setting["Proxy Port"]
+        self.proxy_username = setting.get("Proxy Username", "")
+        self.proxy_password = setting.get("Proxy Password", "")
         self.spread_trading = setting["Spread Trading"] == "True"
         self.margin_currency = setting["Margin Currency"]
 
@@ -184,7 +192,9 @@ class OkxGateway(BaseGateway):
             self.server,
             self.proxy_host,
             self.proxy_port,
-            self.spread_trading
+            self.spread_trading,
+            proxy_username=self.proxy_username,
+            proxy_password=self.proxy_password,
         )
 
     def connect_ws_api(self) -> None:
@@ -195,6 +205,8 @@ class OkxGateway(BaseGateway):
             self.server,
             self.proxy_host,
             self.proxy_port,
+            proxy_username=self.proxy_username,
+            proxy_password=self.proxy_password,
         )
         self.private_api.connect(
             self.key,
@@ -204,6 +216,8 @@ class OkxGateway(BaseGateway):
             self.proxy_host,
             self.proxy_port,
             self.margin_currency,
+            proxy_username=self.proxy_username,
+            proxy_password=self.proxy_password,
         )
 
         if self.spread_trading:
@@ -214,6 +228,8 @@ class OkxGateway(BaseGateway):
                 self.server,
                 self.proxy_host,
                 self.proxy_port,
+                proxy_username=self.proxy_username,
+                proxy_password=self.proxy_password,
             )
 
         self.event_engine.register(EVENT_TIMER, self.process_timer_event)
@@ -430,9 +446,9 @@ class OkxGateway(BaseGateway):
             orderid=order_id,
             direction=DIRECTION_OKX2VT[data["side"]],
             offset=Offset.NONE,
-            traded=float(data["accFillSz"]),
+            traded=get_float_value(data, "accFillSz"),
             price=get_float_value(data, "px"),
-            volume=float(data["sz"]),
+            volume=get_float_value(data, "sz"),
             datetime=parse_timestamp(data["cTime"]),
             status=STATUS_OKX2VT[data["state"]],
             gateway_name=gateway_name,
@@ -468,9 +484,9 @@ class OkxGateway(BaseGateway):
             orderid=order_id,
             direction=DIRECTION_OKX2VT[data["side"]],
             offset=Offset.NONE,
-            traded=float(data["accFillSz"]),
+            traded=get_float_value(data, "accFillSz"),
             price=get_float_value(data, "px"),
-            volume=float(data["sz"]),
+            volume=get_float_value(data, "sz"),
             datetime=parse_timestamp(data["cTime"]),
             status=STATUS_OKX2VT[data["state"]],
             gateway_name=gateway_name,
@@ -488,7 +504,7 @@ class OkxGateway(BaseGateway):
             self.write_log(f"Failed to parse position data, contract not found: {name}")
             return
 
-        pos: float = float(d["pos"])
+        pos: float = get_float_value(d, "pos")
         if inst_type == "MARGIN":
             pos = self.parse_margin_position_volume(d)
 
@@ -642,7 +658,9 @@ class RestApi(RestClient):
         server: str,
         proxy_host: str,
         proxy_port: int,
-        spread_trading: bool
+        spread_trading: bool,
+        proxy_username: str = "",
+        proxy_password: str = "",
     ) -> None:
         """
         Start server connection.
@@ -663,8 +681,9 @@ class RestApi(RestClient):
         self.secret = secret.encode()
         self.passphrase = passphrase
 
-        if server == "DEMO":
-            self.simulated = True
+        self.simulated = server == "DEMO"
+        self.product_ready.clear()
+        self.proxies = None
 
         self.connect_time = int(datetime.now().strftime("%y%m%d%H%M%S"))
 
@@ -675,6 +694,10 @@ class RestApi(RestClient):
 
         host: str = server_hosts[server]
         self.init(host, proxy_host, proxy_port)
+        if proxy_host and proxy_port and (proxy_username or proxy_password):
+            userinfo = f"{quote(proxy_username, safe='')}:{quote(proxy_password, safe='')}"
+            proxy = f"http://{userinfo}@{proxy_host}:{proxy_port}"
+            self.proxies = {"http": proxy, "https": proxy}
 
         self.start()
         self.gateway.write_log("REST API started")
@@ -878,10 +901,9 @@ class RestApi(RestClient):
             else:
                 pricetick = 0
 
-            if d["minSz"]:
-                min_volume: float = float(d["minSz"])
-            else:
-                min_volume = 0
+            # VeighNa uses min_volume as the order quantity increment.
+            # Keep the separate minimum order size in extra['minSz'].
+            min_volume: float = float(d.get("lotSz") or d.get("minSz") or 0)
 
             contract: ContractData = ContractData(
                 symbol=symbol,
@@ -968,12 +990,17 @@ class RestApi(RestClient):
 
         self.gateway.write_log("Spread order data received")
 
+    def on_failed(self, status_code: int, request: Request) -> None:
+        """Report HTTP failure without the signed headers or request body."""
+        path = request.path.split("?", 1)[0]
+        self.gateway.write_log(f"REST request failed: {request.method} {path}, HTTP {status_code}")
+
     def on_error(
         self,
         exc: type,
         value: Exception,
         tb: TracebackType,
-        request: Request
+        request: Request | None
     ) -> None:
         """
         General error callback.
@@ -987,12 +1014,11 @@ class RestApi(RestClient):
             tb: Traceback object
             request: Original request object
         """
-        detail: str = self.exception_detail(exc, value, tb, request)
-        # Escape curly braces to prevent loguru from interpreting them as format placeholders
-        detail = detail.replace("{", "{{").replace("}", "}}")
-
-        msg: str = f"Exception catched by REST API: {detail}"
-        self.gateway.write_log(msg)
+        # RestClient.exception_detail includes signed headers and passphrases.
+        # Exception values may also embed a full request; log only its type.
+        endpoint = (f"{request.method} {request.path.split('?', 1)[0]}"
+                    if request else "initialization")
+        self.gateway.write_log(f"REST request error: {endpoint}, {exc.__name__}")
 
     def _query_history(
         self,
@@ -1176,19 +1202,48 @@ class WebsocketApi(WebsocketClient):
         self.connected: bool = False
         self.callbacks: dict[str, Callable] = {}
         self.server_hosts: dict[str, str] = {}
+        self.proxy_username: str = ""
+        self.proxy_password: str = ""
 
     def connect_(
         self,
         server: str,
         proxy_host: str,
         proxy_port: int,
+        proxy_username: str = "",
+        proxy_password: str = "",
     ) -> None:
         """
         Start server connection.
         """
         host: str = self.server_hosts[server]
+        # Base init() only sets nonempty proxy values; clear stale state too.
+        self.proxy_host = proxy_host
+        self.proxy_port = proxy_port
+        self.proxy_username = proxy_username
+        self.proxy_password = proxy_password
         self.init(host, proxy_host, proxy_port, 20)
         self.start()
+
+    def run(self) -> None:
+        """Verify certificates and hostnames before transmitting credentials."""
+        self.wsapp = websocket.WebSocketApp(
+            url=self.host,
+            header=self.header,
+            on_open=lambda ws: self.on_connected(),
+            on_close=lambda ws, code, message: self.on_disconnected(code, message),
+            on_error=lambda ws, error: self.on_error(error),
+            on_message=lambda ws, message: self.on_message(message),
+        )
+        self.wsapp.run_forever(
+            sslopt={"cert_reqs": ssl.CERT_REQUIRED, "check_hostname": True},
+            ping_interval=self.ping_interval,
+            http_proxy_host=self.proxy_host,
+            http_proxy_port=self.proxy_port,
+            http_proxy_auth=((self.proxy_username, self.proxy_password)
+                             if self.proxy_username or self.proxy_password else None),
+            proxy_type="http" if self.proxy_host else "",
+        )
 
     def on_connected(self) -> None:
         """
@@ -1271,11 +1326,12 @@ class PublicApi(WebsocketApi):
             "DEMO": DEMO_PUBLIC_HOST,
         }
 
-    def connect(self, server: str, proxy_host: str, proxy_port: int) -> None:
+    def connect(self, server: str, proxy_host: str, proxy_port: int,
+                proxy_username: str = "", proxy_password: str = "") -> None:
         """
         Start server connection.
         """
-        self.connect_(server, proxy_host, proxy_port)
+        self.connect_(server, proxy_host, proxy_port, proxy_username, proxy_password)
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """
@@ -1468,6 +1524,8 @@ class PrivateApi(WebsocketApi):
         proxy_host: str,
         proxy_port: int,
         margin_currency: str,
+        proxy_username: str = "",
+        proxy_password: str = "",
     ) -> None:
         """
         Start server connection.
@@ -1490,7 +1548,7 @@ class PrivateApi(WebsocketApi):
 
         self.connect_time = int(datetime.now().strftime("%y%m%d%H%M%S"))
 
-        self.connect_(server, proxy_host, proxy_port)
+        self.connect_(server, proxy_host, proxy_port, proxy_username, proxy_password)
 
     def on_connected(self) -> None:
         """
@@ -1554,15 +1612,14 @@ class PrivateApi(WebsocketApi):
             self.gateway.on_order(order)
 
             # Check if order is filled - skip trade creation if no fill size
-            if d["fillSz"] == "0":
+            if not d.get("fillSz") or d["fillSz"] == "0":
                 continue
 
-            # Process trade data for filled or partially filled orders
-            # Round trade volume number to meet minimum volume precision
-            trade_volume: float = float(d["fillSz"])
+            # Executions are facts: never round individual fills to an order minimum.
+            trade_volume: float = get_float_value(d, "fillSz")
+            if trade_volume <= 0:
+                continue
             contract: ContractData | None = self.gateway.get_contract_by_symbol(order.symbol)
-            if contract:
-                trade_volume = round_to(trade_volume, contract.min_volume)
 
             # Create trade object and push to gateway
             trade: TradeData = TradeData(
@@ -1577,6 +1634,19 @@ class PrivateApi(WebsocketApi):
                 datetime=parse_timestamp(d["uTime"]),
                 gateway_name=self.gateway_name,
             )
+            # fillFee is for this execution; fee is cumulative for the order.
+            # OKX charges are negative, while the strategy's fee fields are costs.
+            trade.extra = {
+                "fillFee": d.get("fillFee", ""),
+                "fillFeeCcy": d.get("fillFeeCcy", ""),
+            }
+            if contract and contract.extra and d.get("fillFee") not in (None, ""):
+                fee: float = -get_float_value(d, "fillFee")
+                fee_ccy: str = d.get("fillFeeCcy", "")
+                if fee_ccy and fee_ccy == contract.extra.get("baseCcy"):
+                    trade.extra["base_fee"] = fee
+                elif fee_ccy and fee_ccy == contract.extra.get("quoteCcy"):
+                    trade.extra["quote_fee"] = fee
             self.gateway.on_trade(trade)
 
     def on_account(self, packet: dict) -> None:
@@ -1596,11 +1666,13 @@ class PrivateApi(WebsocketApi):
         for detail in buf["details"]:
             account: AccountData = AccountData(
                 accountid=detail["ccy"],
-                balance=float(detail["eq"]),
+                balance=get_float_value(detail, "eq"),
                 gateway_name=self.gateway_name,
             )
-            account.available = float(detail["availEq"])
-            account.frozen = float(detail["frozenBal"])
+            # Spot mode does not provide availEq; use its cash available balance.
+            available_key = "availEq" if detail.get("availEq") not in (None, "") else "availBal"
+            account.available = get_float_value(detail, available_key)
+            account.frozen = get_float_value(detail, "frozenBal")
             self.gateway.on_account(account)
 
     def on_position(self, packet: dict) -> None:
@@ -1772,15 +1844,15 @@ class PrivateApi(WebsocketApi):
             "ordType": ORDERTYPE_VT2OKX[req.type],
             "px": str(req.price),
             "sz": str(req.volume),
-            "tdMode": "cross"       # Only support cross margin mode
+            "tdMode": "cash" if contract.extra["instType"] == "SPOT" else "cross"
         }
 
         # Add extra field for portfolio margin
-        if self.margin_currency:
+        if self.margin_currency and arg["tdMode"] != "cash":
             arg["ccy"] = self.margin_currency
 
         # Add extra field for spot
-        if "SPOT" in req.symbol:
+        if contract.extra["instType"] == "SPOT":
             quote_ccy_list: list[str] = contract.extra["tradeQuoteCcyList"]     # type: ignore
             arg["tradeQuoteCcy"] = quote_ccy_list[0]
 
@@ -1890,6 +1962,8 @@ class BusinessApi(WebsocketApi):
         server: str,
         proxy_host: str,
         proxy_port: int,
+        proxy_username: str = "",
+        proxy_password: str = "",
     ) -> None:
         """
         Start server connection.
@@ -1910,7 +1984,7 @@ class BusinessApi(WebsocketApi):
 
         self.connect_time = int(datetime.now().strftime("%y%m%d%H%M%S"))
 
-        self.connect_(server, proxy_host, proxy_port)
+        self.connect_(server, proxy_host, proxy_port, proxy_username, proxy_password)
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """
