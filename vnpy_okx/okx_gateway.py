@@ -3,6 +3,8 @@ import hashlib
 import hmac
 import json
 import ssl
+from threading import Event as ThreadEvent
+from random import uniform
 import time
 from copy import copy
 from datetime import datetime
@@ -1201,6 +1203,9 @@ class WebsocketApi(WebsocketClient):
 
         self.connected: bool = False
         self.on_diagnostic: Callable | None = None
+        self.managed_reconnect = False
+        self.shutdown_event = ThreadEvent()
+        self.before_order_send: Callable | None = None
         self.callbacks: dict[str, Callable] = {}
         self.server_hosts: dict[str, str] = {}
         self.proxy_username: str = ""
@@ -1223,10 +1228,44 @@ class WebsocketApi(WebsocketClient):
         self.proxy_port = proxy_port
         self.proxy_username = proxy_username
         self.proxy_password = proxy_password
+        self.shutdown_event.clear()
         self.init(host, proxy_host, proxy_port, 20)
         self.start()
 
+    def stop(self) -> None:
+        self.shutdown_event.set()
+        super().stop()
+
     def run(self) -> None:
+        if not self.managed_reconnect:
+            self._run_once()
+            return
+        delay = 0
+        while self.active and not self.shutdown_event.is_set():
+            started = time.monotonic()
+            try:
+                self._run_once()
+            except Exception as exc:
+                self.on_error(exc)
+            if self.connected:
+                self.on_disconnected(None, None)
+            if self.shutdown_event.is_set():
+                break
+            if time.monotonic() - started > 120:
+                delay = 0
+            if self.on_diagnostic:
+                self.on_diagnostic("retry", delay_seconds=delay)
+            if self.shutdown_event.wait(delay):
+                break
+            delay = min(60, max(2, delay * 2) * uniform(0.9, 1.1))
+
+    def interrupt_connection(self) -> None:
+        """Wake run_forever; the existing worker exclusively owns the next connection."""
+        app = self.wsapp
+        if app and app.sock:
+            app.sock.abort()
+
+    def _run_once(self) -> None:
         """Verify certificates and hostnames before transmitting credentials."""
         self.wsapp = websocket.WebSocketApp(
             url=self.host,
@@ -1695,6 +1734,9 @@ class PrivateApi(WebsocketApi):
             account.frozen = get_float_value(detail, "frozenBal")
             self.gateway.on_account(account)
 
+        if self.on_diagnostic and any(d.get("ccy") == "USDT" for d in buf["details"]):
+            self.on_diagnostic("account_snapshot")
+
     def on_position(self, packet: dict) -> None:
         """
         Callback of position update.
@@ -1883,7 +1925,15 @@ class PrivateApi(WebsocketApi):
             "op": "order",
             "args": [arg]
         }
-        self.send_packet(packet)
+        if self.before_order_send:
+            self.before_order_send(req, orderid)
+            # A close between the gate and send leaves a queryable, durable clOrdId.
+            if not self.wsapp or not self.connected:
+                raise ConnectionError("Private connection lost during submission")
+        try:
+            self.send_packet(packet)
+        except (OSError, websocket.WebSocketException) as exc:
+            raise ConnectionError("OKX submission requires verification") from exc
 
         # Create order data object and push to gateway
         order: OrderData = req.create_order_data(orderid, self.gateway_name)
@@ -1902,6 +1952,10 @@ class PrivateApi(WebsocketApi):
         Parameters:
             req: Cancel request object containing order details
         """
+        if self.managed_reconnect and not self.connected:
+            if self.on_diagnostic:
+                self.on_diagnostic("cancel_deferred", orderid=req.orderid)
+            return
         # Validate symbol exists in contract map
         contract: ContractData | None = self.gateway.get_contract_by_symbol(req.symbol)
         if not contract:
@@ -1929,7 +1983,13 @@ class PrivateApi(WebsocketApi):
         }
 
         # Send the cancellation request
-        self.send_packet(packet)
+        try:
+            self.send_packet(packet)
+        except (OSError, websocket.WebSocketException):
+            if not self.managed_reconnect:
+                raise
+            if self.on_diagnostic:
+                self.on_diagnostic("cancel_deferred", orderid=req.orderid)
 
 
 class BusinessApi(WebsocketApi):
