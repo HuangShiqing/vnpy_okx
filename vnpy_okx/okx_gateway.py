@@ -1200,6 +1200,7 @@ class WebsocketApi(WebsocketClient):
         self.gateway_name: str = gateway.gateway_name
 
         self.connected: bool = False
+        self.on_diagnostic: Callable | None = None
         self.callbacks: dict[str, Callable] = {}
         self.server_hosts: dict[str, str] = {}
         self.proxy_username: str = ""
@@ -1250,6 +1251,8 @@ class WebsocketApi(WebsocketClient):
         Callback when server is connected.
         """
         self.connected = True
+        if self.on_diagnostic:
+            self.on_diagnostic("open")
         self.gateway.write_log(f"{self.name} connected")
 
     def on_disconnected(self, status_code: int, msg: str) -> None:
@@ -1257,6 +1260,8 @@ class WebsocketApi(WebsocketClient):
         Callback when server is disconnected.
         """
         self.connected = False
+        if self.on_diagnostic:
+            self.on_diagnostic("close", code=status_code, reason=msg)
         self.gateway.write_log(f"{self.name} disconnected, code: {status_code}, msg: {msg}")
 
     def on_message(self, message: str) -> None:
@@ -1264,6 +1269,8 @@ class WebsocketApi(WebsocketClient):
         Callback when websocket app receives new message.
         """
         if message == "pong":
+            if self.on_diagnostic:
+                self.on_diagnostic("pong")
             return
         self.on_packet(json.loads(message))
 
@@ -1271,6 +1278,15 @@ class WebsocketApi(WebsocketClient):
         """
         Callback of data update.
         """
+        if self.on_diagnostic:
+            arg = packet.get("arg") or {}
+            if packet.get("event") in ("notice", "login", "subscribe", "error"):
+                self.on_diagnostic("control", operation=packet["event"], conn_id=packet.get("connId"),
+                                   code=packet.get("code"), subscription_channel=arg.get("channel"),
+                                   instrument=arg.get("instId"),
+                                   notice=packet.get("msg") if packet["event"] == "notice" else None)
+            elif arg.get("channel") in ("books5", "tickers") and packet.get("data"):
+                self.on_diagnostic("market", instrument=arg.get("instId"))
         if "event" in packet:
             cb_name: str = packet["event"]
         elif "op" in packet:
@@ -1295,8 +1311,12 @@ class WebsocketApi(WebsocketClient):
         if self.connected:
             try:
                 self.wsapp.send("ping")
-            except Exception:
-                pass
+            except Exception as exc:
+                if self.on_diagnostic:
+                    self.on_diagnostic("ping_failed", error=exc)
+            else:
+                if self.on_diagnostic:
+                    self.on_diagnostic("ping")
 
 
 class PublicApi(WebsocketApi):
