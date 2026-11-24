@@ -1325,7 +1325,7 @@ class WebsocketApi(WebsocketClient):
                                    instrument=arg.get("instId"),
                                    notice=packet.get("msg") if packet["event"] == "notice" else None)
             elif arg.get("channel") in ("books5", "tickers") and packet.get("data"):
-                self.on_diagnostic("market", instrument=arg.get("instId"))
+                self.on_diagnostic("market", instrument=arg.get("instId"), market_channel=arg["channel"])
         if "event" in packet:
             cb_name: str = packet["event"]
         elif "op" in packet:
